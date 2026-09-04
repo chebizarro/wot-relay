@@ -4,9 +4,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    env_file:
-      - .env
     volumes:
+      - "./.env:/app/.env:ro"
       - "./db:/app/db"
       - "./templates/index.html:${INDEX_PATH}"
       - "./templates/static:${STATIC_PATH}"

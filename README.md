@@ -54,12 +54,43 @@ INDEX_PATH="/home/ubuntu/wot-relay/templates/index.html" # path to the index.htm
 STATIC_PATH="/home/ubuntu/wot-relay/templates/static" # path to the static folder
 REFRESH_INTERVAL_HOURS=24 # interval in hours to refresh the web of trust
 MINIMUM_FOLLOWERS=3 #how many followers before they're allowed in the WoT
+MAX_TRUST_NETWORK=40000 # maximum trusted pubkeys retained
+MAX_ONE_HOP_NETWORK=50000 # maximum direct follows traversed
+MAX_RELAYS=1000 # maximum discovered relays retained
 ARCHIVAL_SYNC="FALSE" # set to TRUE to archive every note from every person in the WoT (not recommended)
 ARCHIVE_REACTIONS="FALSE" # set to TRUE to archive every reaction from every person in the WoT (not recommended)
 IGNORE_FOLLOWS_LIST="" # comma separated list of pubkeys who follow too many bots and ruin the WoT
 SEED_RELAYS="" # optional, comma separated WSS URLs for seed relays (uses built-in defaults if empty)
 ARCHIVE_KINDS="" # optional, comma separated event kind numbers to archive (uses defaults if empty)
 ```
+
+### Live configuration reload
+
+After editing `.env`, send the relay `SIGHUP`:
+
+```bash
+kill -HUP <relay-pid>
+# Docker Compose:
+docker kill --signal=HUP wot-relay
+```
+
+`REFRESH_INTERVAL_HOURS`, `MINIMUM_FOLLOWERS`, `MAX_TRUST_NETWORK`,
+`MAX_ONE_HOP_NETWORK`, `MAX_RELAYS`, and `SEED_RELAYS` reload without a
+restart. A successful reload atomically publishes the complete live snapshot,
+resets the refresh ticker, and immediately refreshes the trust graph. Invalid
+candidates are rejected and the last-valid snapshot remains active.
+
+`RELAY_PUBKEY` is restart-only because it defines the trust graph. If it
+changes on reload, the relay logs a warning and continues using the startup
+root. Other settings also remain fixed until restart.
+Changes to those restart-only settings produce a consolidated warning rather
+than being silently ignored.
+
+When `.env` exists, its keys take precedence over the process environment so an
+edited file cannot be masked by values from the previous startup environment.
+Process environment values remain the fallback for deployments without `.env`
+or for keys omitted from it. Docker Compose mounts `.env` into the container so
+file edits to the live-reloadable keys are visible to the running relay.
 
 ### 4. Build the project
 
@@ -186,6 +217,7 @@ To start the project using Docker Compose, follow these steps:
 
    ```yaml
    volumes:
+     - "./.env:/app/.env:ro"
      - "./db:/app/db" # only change the left side before the colon
      - "./templates/index.html:${INDEX_PATH}" # only change the left side before the colon
      - "./templates/static:${INDEX_PATH}" # only change the left side before the colon

@@ -9,11 +9,11 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 	"os"
+	"os/signal"
 	"runtime"
-	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"fiatjaf.com/nostr"
@@ -21,75 +21,20 @@ import (
 	"fiatjaf.com/nostr/khatru"
 	"fiatjaf.com/nostr/khatru/policies"
 	"fiatjaf.com/nostr/nip11"
-	"github.com/joho/godotenv"
 )
 
 var (
 	version = "0.2.1"
 )
 
-type Config struct {
-	RelayName        string
-	RelayPubkey      string
-	RelayDescription string
-	DBPath           string
-	RelayURL         string
-	IndexPath        string
-	StaticPath       string
-	RefreshInterval  int
-	MinimumFollowers int
-	ArchivalSync     bool
-	RelayContact     string
-	RelayIcon        string
-	MaxAgeDays       int
-	ArchiveReactions bool
-	IgnoredPubkeys   []string
-	MaxTrustNetwork  int
-	MaxRelays        int
-	MaxOneHopNetwork int
-	SeedRelays       []string
-	ArchiveKinds     []nostr.Kind
-}
-
-var defaultSeedRelays = []string{
-	"wss://nos.lol",
-	"wss://nostr.mom",
-	"wss://purplepag.es",
-	"wss://purplerelay.com",
-	"wss://relay.damus.io",
-	"wss://relay.nostr.band",
-	"wss://relay.snort.social",
-	"wss://relayable.org",
-	"wss://relay.primal.net",
-	"wss://relay.nostr.bg",
-	"wss://no.str.cr",
-	"wss://nostr21.com",
-	"wss://nostrue.com",
-	"wss://relay.siamstr.com",
-}
-
-var defaultArchiveKinds = []nostr.Kind{
-	nostr.KindArticle,
-	nostr.KindDeletion,
-	nostr.KindFollowList,
-	nostr.KindEncryptedDirectMessage,
-	nostr.KindMuteList,
-	nostr.KindRelayListMetadata,
-	nostr.KindRepost,
-	nostr.KindZapRequest,
-	nostr.KindZap,
-	nostr.KindTextNote,
-}
-
 var pool *nostr.Pool
 var db *lmdb.LMDBBackend
 var relays []string
 var relaySet = make(map[string]bool) // O(1) lookup
 var config Config
+var runtimeConfig runtimeConfigStore
 var trustNetwork []string
 var trustNetworkSet = make(map[string]bool) // O(1) lookup
-var seedRelays []string
-var booted bool
 var oneHopNetwork []string
 var oneHopNetworkSet = make(map[string]bool) // O(1) lookup
 var trustNetworkMap map[string]bool
@@ -117,7 +62,6 @@ var (
 
 func main() {
 	nostr.InfoLogger = log.New(io.Discard, "", 0)
-	booted = false
 	green := "\033[32m"
 	reset := "\033[0m"
 
@@ -141,7 +85,14 @@ func main() {
 	ctx := context.Background()
 	pool = nostr.NewPool()
 	pool.Context = ctx
-	config = LoadConfig()
+	var err error
+	config, err = LoadConfig()
+	if err != nil {
+		log.Fatalf("invalid configuration: %v", err)
+	}
+	runtimeConfig.Store(config)
+	log.Printf("refresh interval set to %s", runtimeConfig.Load().RefreshInterval)
+	log.Printf("using %d seed relays", len(runtimeConfig.Load().SeedRelays))
 
 	relay.Info = &nip11.RelayInformationDocument{
 		Name:        config.RelayName,
@@ -204,9 +155,13 @@ func main() {
 
 	relay.RejectConnection = policies.ConnectionRateLimiter(10, time.Minute*2, 30)
 
-	seedRelays = config.SeedRelays
+	reloadSignals := make(chan os.Signal, 1)
+	signal.Notify(reloadSignals, syscall.SIGHUP)
+	defer signal.Stop(reloadSignals)
+	runtimeConfigUpdates := make(chan struct{}, 1)
+	go handleConfigReloads(ctx, reloadSignals, LoadConfig, config, &runtimeConfig, runtimeConfigUpdates, log.Default())
 
-	go refreshTrustNetwork(ctx, relay)
+	go refreshTrustNetwork(ctx, relay, runtimeConfigUpdates)
 	go monitorMemoryUsage()
 	go monitorPerformance()
 
@@ -220,7 +175,7 @@ func main() {
 	mux.HandleFunc("GET /debug/goroutines", debugGoroutinesHandler)
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		tmpl := template.Must(template.ParseFiles(os.Getenv("INDEX_PATH")))
+		tmpl := template.Must(template.ParseFiles(config.IndexPath))
 		data := struct {
 			RelayName        string
 			RelayPubkey      string
@@ -238,152 +193,20 @@ func main() {
 		}
 	})
 
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "3334"
-	}
+	port := config.Port
 	log.Printf("🎉 relay running on port :%s", port)
 	log.Println("🔍 debug endpoints available at:")
 	log.Printf("   http://localhost:%s/debug/pprof/ (CPU/memory profiling)", port)
 	log.Printf("   http://localhost:%s/debug/stats (application stats)", port)
 	log.Printf("   http://localhost:%s/debug/goroutines (goroutine info)", port)
-	err := http.ListenAndServe(":"+port, relay)
+	err = http.ListenAndServe(":"+port, relay)
 	if err != nil {
 		log.Fatal(err)
 	}
 }
 
-func LoadConfig() Config {
-	godotenv.Load(".env")
-
-	if os.Getenv("REFRESH_INTERVAL_HOURS") == "" {
-		os.Setenv("REFRESH_INTERVAL_HOURS", "3")
-	}
-
-	refreshInterval, _ := strconv.Atoi(os.Getenv("REFRESH_INTERVAL_HOURS"))
-	log.Println("🔄 refresh interval set to", refreshInterval, "hours")
-
-	if os.Getenv("MINIMUM_FOLLOWERS") == "" {
-		os.Setenv("MINIMUM_FOLLOWERS", "1")
-	}
-
-	if os.Getenv("ARCHIVAL_SYNC") == "" {
-		os.Setenv("ARCHIVAL_SYNC", "TRUE")
-	}
-
-	if os.Getenv("RELAY_ICON") == "" {
-		os.Setenv("RELAY_ICON", "https://pfp.nostr.build/56306a93a88d4c657d8a3dfa57b55a4ed65b709eee927b5dafaab4d5330db21f.png")
-	}
-
-	if os.Getenv("RELAY_CONTACT") == "" {
-		os.Setenv("RELAY_CONTACT", getEnv("RELAY_PUBKEY"))
-	}
-
-	if os.Getenv("MAX_AGE_DAYS") == "" {
-		os.Setenv("MAX_AGE_DAYS", "0")
-	}
-
-	if os.Getenv("ARCHIVE_REACTIONS") == "" {
-		os.Setenv("ARCHIVE_REACTIONS", "FALSE")
-	}
-
-	if os.Getenv("MAX_TRUST_NETWORK") == "" {
-		os.Setenv("MAX_TRUST_NETWORK", "40000")
-	}
-
-	if os.Getenv("MAX_RELAYS") == "" {
-		os.Setenv("MAX_RELAYS", "1000")
-	}
-
-	if os.Getenv("MAX_ONE_HOP_NETWORK") == "" {
-		os.Setenv("MAX_ONE_HOP_NETWORK", "50000")
-	}
-
-	ignoredPubkeys := []string{}
-	if ignoreList := os.Getenv("IGNORE_FOLLOWS_LIST"); ignoreList != "" {
-		ignoredPubkeys = splitAndTrim(ignoreList)
-	}
-
-	minimumFollowers, _ := strconv.Atoi(os.Getenv("MINIMUM_FOLLOWERS"))
-	maxAgeDays, _ := strconv.Atoi(os.Getenv("MAX_AGE_DAYS"))
-	maxTrustNetwork, _ := strconv.Atoi(os.Getenv("MAX_TRUST_NETWORK"))
-	maxRelays, _ := strconv.Atoi(os.Getenv("MAX_RELAYS"))
-	maxOneHopNetwork, _ := strconv.Atoi(os.Getenv("MAX_ONE_HOP_NETWORK"))
-
-	// Parse configurable seed relays, fall back to defaults
-	parsedSeedRelays := defaultSeedRelays
-	if sr := os.Getenv("SEED_RELAYS"); sr != "" {
-		parsedSeedRelays = splitAndTrim(sr)
-		log.Printf("🌱 using %d custom seed relays", len(parsedSeedRelays))
-	} else {
-		log.Printf("🌱 using %d default seed relays", len(parsedSeedRelays))
-	}
-
-	// Parse configurable archive kinds, fall back to defaults
-	archiveReactions := getEnv("ARCHIVE_REACTIONS") == "TRUE"
-	parsedArchiveKinds := make([]nostr.Kind, len(defaultArchiveKinds))
-	copy(parsedArchiveKinds, defaultArchiveKinds)
-	if ak := os.Getenv("ARCHIVE_KINDS"); ak != "" {
-		kindStrs := splitAndTrim(ak)
-		parsedArchiveKinds = []nostr.Kind{}
-		for _, ks := range kindStrs {
-			if k, err := strconv.Atoi(ks); err == nil {
-				parsedArchiveKinds = append(parsedArchiveKinds, nostr.Kind(k))
-			} else {
-				log.Printf("⚠️ ignoring invalid ARCHIVE_KINDS value: %s", ks)
-			}
-		}
-		log.Printf("📦 using %d custom archive kinds", len(parsedArchiveKinds))
-	}
-	// Add reaction kind if ARCHIVE_REACTIONS is enabled and not already present
-	if archiveReactions {
-		hasReaction := false
-		for _, k := range parsedArchiveKinds {
-			if k == nostr.KindReaction {
-				hasReaction = true
-				break
-			}
-		}
-		if !hasReaction {
-			parsedArchiveKinds = append(parsedArchiveKinds, nostr.KindReaction)
-		}
-	}
-
-	config := Config{
-		RelayName:        getEnv("RELAY_NAME"),
-		RelayPubkey:      getEnv("RELAY_PUBKEY"),
-		RelayDescription: getEnv("RELAY_DESCRIPTION"),
-		RelayContact:     getEnv("RELAY_CONTACT"),
-		RelayIcon:        getEnv("RELAY_ICON"),
-		DBPath:           getEnv("DB_PATH"),
-		RelayURL:         getEnv("RELAY_URL"),
-		IndexPath:        getEnv("INDEX_PATH"),
-		StaticPath:       getEnv("STATIC_PATH"),
-		RefreshInterval:  refreshInterval,
-		MinimumFollowers: minimumFollowers,
-		ArchivalSync:     getEnv("ARCHIVAL_SYNC") == "TRUE",
-		MaxAgeDays:       maxAgeDays,
-		ArchiveReactions: archiveReactions,
-		IgnoredPubkeys:   ignoredPubkeys,
-		MaxTrustNetwork:  maxTrustNetwork,
-		MaxRelays:        maxRelays,
-		MaxOneHopNetwork: maxOneHopNetwork,
-		SeedRelays:       parsedSeedRelays,
-		ArchiveKinds:     parsedArchiveKinds,
-	}
-
-	return config
-}
-
-func getEnv(key string) string {
-	value, exists := os.LookupEnv(key)
-	if !exists {
-		log.Fatalf("Environment variable %s not set", key)
-	}
-	return value
-}
-
 func updateTrustNetworkFilter() {
+	runtime := runtimeConfig.Load()
 	// Build new trust network in temporary variables
 	newTrustNetworkMap := make(map[string]bool)
 	var newTrustNetwork []string
@@ -393,9 +216,9 @@ func updateTrustNetworkFilter() {
 
 	followerMutex.RLock()
 	for pubkey, count := range pubkeyFollowerCount {
-		if count >= config.MinimumFollowers {
+		if count >= runtime.MinimumFollowers {
 			newTrustNetworkMap[pubkey] = true
-			if !newTrustNetworkSet[pubkey] && len(pubkey) == 64 && len(newTrustNetwork) < config.MaxTrustNetwork {
+			if !newTrustNetworkSet[pubkey] && len(pubkey) == 64 && len(newTrustNetwork) < runtime.MaxTrustNetwork {
 				newTrustNetwork = append(newTrustNetwork, pubkey)
 				newTrustNetworkSet[pubkey] = true
 			}
@@ -414,11 +237,11 @@ func updateTrustNetworkFilter() {
 
 	// Cleanup follower count map periodically to prevent unbounded growth
 	followerMutex.Lock()
-	if len(pubkeyFollowerCount) > config.MaxOneHopNetwork*2 {
+	if len(pubkeyFollowerCount) > runtime.MaxOneHopNetwork*2 {
 		log.Println("🧹 cleaning follower count map")
 		newFollowerCount := make(map[string]int)
 		for pubkey, count := range pubkeyFollowerCount {
-			if count >= config.MinimumFollowers || newTrustNetworkMap[pubkey] {
+			if count >= runtime.MinimumFollowers || newTrustNetworkMap[pubkey] {
 				newFollowerCount[pubkey] = count
 			}
 		}
@@ -440,6 +263,7 @@ func hexToPubKeys(hexes []string) []nostr.PubKey {
 }
 
 func refreshProfiles(ctx context.Context) {
+	runtime := runtimeConfig.Load()
 	atomic.AddUint64(&profileRefreshCount, 1)
 	start := time.Now()
 
@@ -479,7 +303,7 @@ func refreshProfiles(ctx context.Context) {
 				Kinds:   []nostr.Kind{nostr.KindProfileMetadata},
 			}
 
-			for ev := range pool.FetchMany(timeout, seedRelays, filter, nostr.SubscriptionOptions{}) {
+			for ev := range pool.FetchMany(timeout, runtime.SeedRelays, filter, nostr.SubscriptionOptions{}) {
 				if err := db.SaveEvent(ev.Event); err != nil {
 					nostr.InfoLogger.Printf("save profile: %v", err)
 				}
@@ -491,8 +315,9 @@ func refreshProfiles(ctx context.Context) {
 	log.Printf("👤 profiles refreshed: %d profiles in %v", len(currentTrustNetwork), duration)
 }
 
-func refreshTrustNetwork(ctx context.Context, relay *khatru.Relay) {
+func refreshTrustNetwork(ctx context.Context, relay *khatru.Relay, configUpdates <-chan struct{}) {
 	runTrustNetworkRefresh := func() {
+		runtime := runtimeConfig.Load()
 		atomic.AddUint64(&networkRefreshCount, 1)
 		start := time.Now()
 
@@ -523,7 +348,7 @@ func refreshTrustNetwork(ctx context.Context, relay *khatru.Relay) {
 
 		log.Println("🔍 fetching owner's follows")
 		eventCount := 0
-		for ev := range pool.FetchMany(timeoutCtx, seedRelays, filter, nostr.SubscriptionOptions{}) {
+		for ev := range pool.FetchMany(timeoutCtx, runtime.SeedRelays, filter, nostr.SubscriptionOptions{}) {
 			eventCount++
 			for contact := range ev.Tags.FindAll("p") {
 				if len(contact) < 2 {
@@ -537,7 +362,7 @@ func refreshTrustNetwork(ctx context.Context, relay *khatru.Relay) {
 				newPubkeyFollowerCount[pubkey]++
 
 				// Add to new one-hop network
-				if !newOneHopNetworkSet[pubkey] && len(pubkey) == 64 && len(newOneHopNetwork) < config.MaxOneHopNetwork {
+				if !newOneHopNetworkSet[pubkey] && len(pubkey) == 64 && len(newOneHopNetwork) < runtime.MaxOneHopNetwork {
 					newOneHopNetwork = append(newOneHopNetwork, pubkey)
 					newOneHopNetworkSet[pubkey] = true
 				}
@@ -581,7 +406,7 @@ func refreshTrustNetwork(ctx context.Context, relay *khatru.Relay) {
 					Kinds:   []nostr.Kind{nostr.KindFollowList, nostr.KindRelayListMetadata, nostr.KindProfileMetadata},
 				}
 
-				for ev := range pool.FetchMany(timeout, seedRelays, filter, nostr.SubscriptionOptions{}) {
+				for ev := range pool.FetchMany(timeout, runtime.SeedRelays, filter, nostr.SubscriptionOptions{}) {
 					atomic.AddInt64(&totalProcessed, 1)
 
 					hasP := false
@@ -634,42 +459,94 @@ func refreshTrustNetwork(ctx context.Context, relay *khatru.Relay) {
 		relayMutex.RUnlock()
 	}
 
-	ticker := time.NewTicker(time.Duration(config.RefreshInterval) * time.Hour)
-	defer ticker.Stop()
-
 	// Run initial refresh
 	log.Println("🚀 performing initial trust network build...")
 	runTrustNetworkRefresh()
 	updateTrustNetworkFilter()
-
-	// Mark as booted after initial trust network is built
-	booted = true
 	log.Println("✅ trust network initialized, relay is now active")
 
-	deleteOldNotes()
-	archiveTrustedNotes(ctx, relay)
+	if err := deleteOldNotes(); err != nil {
+		log.Printf("delete old notes: %v", err)
+	}
 
-	// Then run on timer
+	var cancelArchive context.CancelFunc
+	startArchive := func() {
+		archiveCtx, cancel := context.WithCancel(ctx)
+		cancelArchive = cancel
+		go archiveTrustedNotes(archiveCtx, relay)
+	}
+	stopArchive := func() {
+		if cancelArchive != nil {
+			cancelArchive()
+			cancelArchive = nil
+		}
+	}
+	defer stopArchive()
+	startArchive()
+
+	runRefreshSchedule(ctx, configUpdates, func(reloaded bool) {
+		stopArchive()
+		if reloaded {
+			log.Println("🔄 runtime configuration changed; refreshing trust network immediately...")
+		} else {
+			log.Println("🔄 refreshing trust network in background...")
+		}
+		runTrustNetworkRefresh()
+		updateTrustNetworkFilter()
+		if err := deleteOldNotes(); err != nil {
+			log.Printf("delete old notes: %v", err)
+		}
+		startArchive()
+		log.Println("✅ trust network refresh completed")
+	}, newRefreshTicker)
+}
+
+type refreshTicker interface {
+	Chan() <-chan time.Time
+	Reset(time.Duration)
+	Stop()
+}
+
+type realRefreshTicker struct {
+	*time.Ticker
+}
+
+func (t *realRefreshTicker) Chan() <-chan time.Time {
+	return t.C
+}
+
+func newRefreshTicker(interval time.Duration) refreshTicker {
+	return &realRefreshTicker{Ticker: time.NewTicker(interval)}
+}
+
+func runRefreshSchedule(
+	ctx context.Context,
+	configUpdates <-chan struct{},
+	refresh func(reloaded bool),
+	newTicker func(time.Duration) refreshTicker,
+) {
+	ticker := newTicker(runtimeConfig.Load().RefreshInterval)
+	defer ticker.Stop()
+
 	for {
 		select {
-		case <-ticker.C:
-			log.Println("🔄 refreshing trust network in background...")
-			runTrustNetworkRefresh()
-			updateTrustNetworkFilter()
-			deleteOldNotes()
-			archiveTrustedNotes(ctx, relay)
-			log.Println("✅ trust network refresh completed")
 		case <-ctx.Done():
 			return
+		case <-ticker.Chan():
+			refresh(false)
+		case <-configUpdates:
+			ticker.Reset(runtimeConfig.Load().RefreshInterval)
+			refresh(true)
 		}
 	}
 }
 
 func appendRelay(relay string) {
+	runtime := runtimeConfig.Load()
 	relayMutex.Lock()
 	defer relayMutex.Unlock()
 
-	if len(relays) >= config.MaxRelays {
+	if len(relays) >= runtime.MaxRelays {
 		return // Prevent unbounded growth
 	}
 
@@ -682,10 +559,11 @@ func appendRelay(relay string) {
 }
 
 func appendPubkey(pubkey string) {
+	runtime := runtimeConfig.Load()
 	trustNetworkMutex.Lock()
 	defer trustNetworkMutex.Unlock()
 
-	if len(trustNetwork) >= config.MaxTrustNetwork {
+	if len(trustNetwork) >= runtime.MaxTrustNetwork {
 		return // Prevent unbounded growth
 	}
 
@@ -702,70 +580,58 @@ func appendPubkey(pubkey string) {
 }
 
 func archiveTrustedNotes(ctx context.Context, relay *khatru.Relay) {
-	timeout, cancel := context.WithTimeout(ctx, time.Duration(config.RefreshInterval)*time.Hour)
+	runtimeCfg := runtimeConfig.Load()
+	timeout, cancel := context.WithTimeout(ctx, runtimeCfg.RefreshInterval)
 	defer cancel()
 
-	done := make(chan struct{})
-
-	go func() {
-		defer close(done)
-		if config.ArchivalSync {
-			go refreshProfiles(ctx)
-
-			since := nostr.Now()
-			filter := nostr.Filter{
-				Kinds: config.ArchiveKinds,
-				Since: since,
-			}
-
-			log.Println("📦 archiving trusted notes...")
-
-			eventCount := 0
-			for ev := range pool.SubscribeMany(timeout, seedRelays, filter, nostr.SubscriptionOptions{}) {
-				eventCount++
-
-				// Check GC pressure every 1000 events
-				if eventCount%1000 == 0 {
-					var m runtime.MemStats
-					runtime.ReadMemStats(&m)
-					if m.NumGC > 0 && eventCount > 1000 {
-						gcRate := float64(m.NumGC) / float64(eventCount/1000)
-						if gcRate > 2.0 {
-							log.Printf("⚠️ High GC pressure (%.1f GC/1000 events), slowing archive process", gcRate)
-							time.Sleep(100 * time.Millisecond)
-						}
-					}
-				}
-
-				// Use semaphore to limit concurrent goroutines
-				select {
-				case archiveEventSemaphore <- struct{}{}:
-					go func(event nostr.Event) {
-						defer func() { <-archiveEventSemaphore }()
-						archiveEvent(ctx, relay, event)
-					}(ev.Event)
-				case <-timeout.Done():
-					log.Printf("📦 archive timeout reached, processed %d events", eventCount)
-					return
-				default:
-					archiveEvent(ctx, relay, ev.Event)
-				}
-			}
-
-			log.Printf("📦 archived %d trusted notes and discarded %d untrusted notes (processed %d total events)",
-				atomic.LoadUint64(&trustedNotes), atomic.LoadUint64(&untrustedNotes), eventCount)
-		} else {
-			log.Println("🔄 web of trust will refresh in", config.RefreshInterval, "hours")
-			<-timeout.Done()
-		}
-	}()
-
-	select {
-	case <-timeout.Done():
-		log.Println("restarting process")
-	case <-done:
-		log.Println("📦 archiving process completed")
+	if !config.ArchivalSync {
+		log.Println("🔄 web of trust will refresh in", runtimeCfg.RefreshInterval)
+		<-timeout.Done()
+		return
 	}
+
+	go refreshProfiles(timeout)
+
+	filter := nostr.Filter{
+		Kinds: config.ArchiveKinds,
+		Since: nostr.Now(),
+	}
+
+	log.Println("📦 archiving trusted notes...")
+	eventCount := 0
+	for ev := range pool.SubscribeMany(timeout, runtimeCfg.SeedRelays, filter, nostr.SubscriptionOptions{}) {
+		eventCount++
+
+		// Check GC pressure every 1000 events
+		if eventCount%1000 == 0 {
+			var m runtime.MemStats
+			runtime.ReadMemStats(&m)
+			if m.NumGC > 0 && eventCount > 1000 {
+				gcRate := float64(m.NumGC) / float64(eventCount/1000)
+				if gcRate > 2.0 {
+					log.Printf("⚠️ High GC pressure (%.1f GC/1000 events), slowing archive process", gcRate)
+					time.Sleep(100 * time.Millisecond)
+				}
+			}
+		}
+
+		// Use semaphore to limit concurrent goroutines
+		select {
+		case archiveEventSemaphore <- struct{}{}:
+			go func(event nostr.Event) {
+				defer func() { <-archiveEventSemaphore }()
+				archiveEvent(timeout, relay, event)
+			}(ev.Event)
+		case <-timeout.Done():
+			log.Printf("📦 archive cycle stopped, processed %d events", eventCount)
+			return
+		default:
+			archiveEvent(timeout, relay, ev.Event)
+		}
+	}
+
+	log.Printf("📦 archived %d trusted notes and discarded %d untrusted notes (processed %d total events)",
+		atomic.LoadUint64(&trustedNotes), atomic.LoadUint64(&untrustedNotes), eventCount)
 }
 
 func archiveEvent(ctx context.Context, relay *khatru.Relay, ev nostr.Event) {
@@ -820,14 +686,6 @@ func deleteOldNotes() error {
 	}
 
 	return nil
-}
-
-func splitAndTrim(input string) []string {
-	items := strings.Split(input, ",")
-	for i, item := range items {
-		items[i] = strings.TrimSpace(item)
-	}
-	return items
 }
 
 func isIgnored(pubkey string, ignoredPubkeys []string) bool {
