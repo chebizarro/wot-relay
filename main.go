@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"html/template"
 	"io"
+	"iter"
 	"log"
 	"net/http"
 	_ "net/http/pprof"
@@ -17,6 +19,7 @@ import (
 	"time"
 
 	"fiatjaf.com/nostr"
+	"fiatjaf.com/nostr/eventstore"
 	"fiatjaf.com/nostr/eventstore/lmdb"
 	"fiatjaf.com/nostr/khatru"
 	"fiatjaf.com/nostr/khatru/policies"
@@ -81,6 +84,9 @@ func main() {
 
 	fmt.Println(green + art + reset)
 	log.Println("🚀 booting up web of trust relay")
+	build := buildInfo()
+	log.Printf("wot-relay build: revision=%s source=%s built=%s go=%s lmdb_engine=%q modules=%v",
+		build.Revision, choose(build.Source, "-"), choose(build.BuildTime, "-"), build.GoVersion, build.LMDBEngine, build.Modules)
 	relay := khatru.NewRelay()
 	ctx := context.Background()
 	pool = nostr.NewPool()
@@ -108,11 +114,65 @@ func main() {
 
 	appendPubkey(config.RelayPubkey)
 
+	// --- LMDB hardening (ported from cascadia-relay@12ad754) ---
+	// The eventstore is the only LMDB handle in this process. Register the path
+	// first so any monitor or helper that tries to open it independently fails
+	// (lmdb_runtime.go).
+	if err := registerLiveLMDBPath(config.DBPath); err != nil {
+		log.Fatalf("lmdb live path registration failed: %v", err)
+	}
+	lmdbRT := newLMDBRuntime(config.DBPath, 0, 0, "")
+	lmdbRT.logConfigurationDrift()
+	readTracker := &lmdbReadTracker{}
+	faultMonitor := installLMDBFaultMonitor() // before the eventstore opens
+
+	// Unclean-exit handling runs before the eventstore opens so the crash-time
+	// store is preserved before any write can happen (lmdb_unclean_exit.go).
+	if !validUncleanExitPolicy(config.LMDBUncleanExitPolicy) {
+		log.Fatalf("invalid LMDB_UNCLEAN_EXIT_POLICY=%q (want %s or %s)", config.LMDBUncleanExitPolicy, uncleanExitPolicyQuarantine, uncleanExitPolicyResume)
+	}
+	if err := os.MkdirAll(config.DBPath, 0o755); err != nil {
+		log.Fatalf("lmdb path: %v", err)
+	}
+	uncleanCfg := uncleanExitConfig{Policy: config.LMDBUncleanExitPolicy, EvidenceDir: config.LMDBEvidenceDir}
+	incident, err := detectUncleanExit(config.DBPath, uncleanCfg)
+	if err != nil {
+		log.Fatalf("lmdb unclean-exit check failed: %v", err)
+	}
+	if incident != nil {
+		log.Printf("lmdb: previous run (pid %d, started %s) ended uncleanly; evidence=%q snapshot_error=%q policy=%s",
+			incident.PreviousRun.PID, incident.PreviousRun.StartedAt.Format(time.RFC3339), incident.EvidenceDir, incident.SnapshotError, incident.Policy)
+		if incident.Quarantined {
+			qctx, qcancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
+			err := holdQuarantine(qctx, fmt.Sprintf("0.0.0.0:%s", config.Port), config.DBPath, incident, quarantinePollInterval)
+			qcancel()
+			if err != nil {
+				log.Printf("lmdb: quarantine ended without release (%v); exiting with store closed", err)
+				return
+			}
+		}
+	}
+
 	db = &lmdb.LMDBBackend{Path: config.DBPath}
+	// The run sentinel marks the store open by this process; it is cleared on a
+	// clean shutdown. A sentinel found at the next startup means an unclean exit.
+	if err := writeRunSentinel(config.DBPath, build.Revision); err != nil {
+		log.Fatalf("lmdb run sentinel: %v", err)
+	}
 	if err := db.Init(); err != nil {
+		_ = clearRunSentinel(config.DBPath)
 		panic(err)
 	}
-	relay.UseEventstore(db, 500)
+	defer func() {
+		log.Println("closing database...")
+		db.Close()
+		if err := clearRunSentinel(config.DBPath); err != nil {
+			log.Printf("lmdb run sentinel not cleared: %v", err)
+		}
+		log.Println("database closed")
+	}()
+	store := &trackedStore{inner: db, reads: readTracker}
+	relay.UseEventstore(store, 500)
 
 	relay.OnEvent = policies.SeqEvent(
 		policies.RejectEventsWithBase64Media,
@@ -173,6 +233,7 @@ func main() {
 
 	mux.HandleFunc("GET /debug/stats", debugStatsHandler)
 	mux.HandleFunc("GET /debug/goroutines", debugGoroutinesHandler)
+	mux.HandleFunc("GET /health", newHealthHandler(config.RelayName, lmdbRT, readTracker, faultMonitor))
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		tmpl := template.Must(template.ParseFiles(config.IndexPath))
@@ -829,4 +890,92 @@ func debugGoroutinesHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "text/plain")
 	w.Write(buf[:stackSize])
+}
+
+// defaultLMDBMapSize is the map size reported for the live environment when the
+// operator has not configured one. Ported from cascadia-relay@12ad754.
+const defaultLMDBMapSize int64 = 1 << 38
+
+func effectiveLMDBMapSize(mapSize int64) int64 {
+	if mapSize > 0 {
+		return mapSize
+	}
+	return defaultLMDBMapSize
+}
+
+func choose(v, def string) string {
+	if v != "" {
+		return v
+	}
+	return def
+}
+
+// trackedStore wraps the eventstore so every read transaction served through
+// khatru is counted for /health and the reader monitor. It never opens a
+// second LMDB environment; it only delegates to the single live backend.
+// Ported from cascadia-relay@12ad754 (lockedStore, read-tracking subset).
+type trackedStore struct {
+	inner eventstore.Store
+	reads *lmdbReadTracker
+}
+
+func (s *trackedStore) Init() error { return s.inner.Init() }
+
+func (s *trackedStore) Close() { s.inner.Close() }
+
+func (s *trackedStore) QueryEvents(filter nostr.Filter, maxLimit int) iter.Seq[nostr.Event] {
+	seq := s.inner.QueryEvents(filter, maxLimit)
+	if s.reads == nil {
+		return seq
+	}
+	return s.reads.trackQuery(seq)
+}
+
+func (s *trackedStore) CountEvents(filter nostr.Filter) (uint32, error) {
+	if s.reads != nil {
+		s.reads.begin()
+		defer s.reads.end()
+	}
+	return s.inner.CountEvents(filter)
+}
+
+func (s *trackedStore) SaveEvent(evt nostr.Event) error { return s.inner.SaveEvent(evt) }
+
+func (s *trackedStore) ReplaceEvent(evt nostr.Event) ([]nostr.Event, error) {
+	return s.inner.ReplaceEvent(evt)
+}
+
+func (s *trackedStore) DeleteEvent(id nostr.ID) error { return s.inner.DeleteEvent(id) }
+
+// newHealthHandler reports relay identity plus LMDB state derived only from
+// configuration and in-process counters. It must never open the live
+// environment; see lmdb_runtime.go. It answers 503 status=degraded once any
+// eventstore fault signature has been observed (lmdb_fault_monitor.go).
+// Ported from cascadia-relay@12ad754.
+func newHealthHandler(relayName string, lmdbRT lmdbRuntime, tracker *lmdbReadTracker, faults *lmdbFaultMonitor) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var divergence lmdbFaultSnapshot
+		if faults != nil {
+			divergence = faults.snapshot()
+		}
+		status, code := "ok", http.StatusOK
+		if divergence.Detected {
+			status, code = "degraded", http.StatusServiceUnavailable
+		}
+		body := map[string]any{
+			"ok":                    !divergence.Detected,
+			"status":                status,
+			"lmdb_index_divergence": divergence,
+			"name":                  relayName,
+			"build":                 buildInfo(),
+			"db":                    lmdbRT.Path,
+			"backend":               "lmdb",
+		}
+		for k, v := range lmdbHealthFields(lmdbRT, tracker) {
+			body[k] = v
+		}
+		w.Header().Set("content-type", "application/json")
+		w.WriteHeader(code)
+		_ = json.NewEncoder(w).Encode(body)
+	}
 }
