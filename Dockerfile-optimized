@@ -1,6 +1,12 @@
 # Stage 1: Build the Go application
 FROM golang:bookworm AS builder
 
+# Provenance, injected by the build workflow. Defaults make an ad-hoc build
+# visibly unlabelled rather than silently claiming a revision.
+ARG GIT_COMMIT=unknown
+ARG SOURCE_URL=https://github.com/bitvora/wot-relay
+ARG BUILD_TIME=
+
 # Set the working directory within the container
 WORKDIR /app
 
@@ -21,11 +27,28 @@ ENV STATIC_PATH="templates/static"
 # touch a .env
 RUN touch .env
 
-# Build the Go application
-RUN go build -o main .
+# Build the Go application. CGO is required: PowerDNS/lmdb-go compiles the LMDB
+# C sources into the binary. Link-time -X vars carry build provenance, and
+# `go version -m` records the exact module graph in /app/PROVENANCE.txt.
+RUN CGO_ENABLED=1 go build -trimpath \
+      -ldflags "-X main.buildRevision=${GIT_COMMIT} -X main.buildSource=${SOURCE_URL} -X main.buildTime=${BUILD_TIME}" \
+      -o main . \
+    && { echo "revision=${GIT_COMMIT}"; echo "source=${SOURCE_URL}"; echo "build_time=${BUILD_TIME}"; echo; \
+         go version -m main; } > /app/PROVENANCE.txt
 
 # Stage 2: Create a minimal image to run the Go application
 FROM debian:bookworm-slim
+
+# Provenance labels (OCI image spec).
+ARG GIT_COMMIT=unknown
+ARG SOURCE_URL=https://github.com/bitvora/wot-relay
+ARG BUILD_TIME=
+LABEL org.opencontainers.image.title="wot-relay" \
+      org.opencontainers.image.description="Web-of-trust Nostr relay (khatru + nostrlib LMDB eventstore)" \
+      org.opencontainers.image.source="${SOURCE_URL}" \
+      org.opencontainers.image.revision="${GIT_COMMIT}" \
+      org.opencontainers.image.created="${BUILD_TIME}" \
+      org.opencontainers.image.version="git-${GIT_COMMIT}"
 
 # Set the working directory within the container
 WORKDIR /app
@@ -36,6 +59,9 @@ COPY --from=builder /app/main /app/
 # Copy any necessary files like templates, static assets, etc.
 COPY --from=builder /app/templates /app/templates
 COPY --from=builder /app/.env /app/
+
+# Exact module graph and link-time provenance of the shipped binary.
+COPY --from=builder /app/PROVENANCE.txt /app/PROVENANCE.txt
 
 # Expose the port that the application will run on
 EXPOSE 3334

@@ -39,6 +39,10 @@ type Config struct {
 	MaxOneHopNetwork int
 	SeedRelays       []string
 	ArchiveKinds     []nostr.Kind
+	// Restart-only LMDB hardening settings (lmdb_unclean_exit.go). Changes on
+	// SIGHUP are logged but not applied until the process restarts.
+	LMDBUncleanExitPolicy string // quarantine | snapshot-and-resume
+	LMDBEvidenceDir       string // empty: <parent of resolved DB_PATH>/lmdb-evidence
 }
 
 var defaultSeedRelays = []string{
@@ -236,6 +240,12 @@ func loadConfig(dotEnvPath string, environ []string) (Config, error) {
 		return Config{}, fmt.Errorf("PORT must be an integer between 1 and 65535, got %q", port)
 	}
 
+	uncleanExitPolicy := withDefault("LMDB_UNCLEAN_EXIT_POLICY", uncleanExitPolicyQuarantine)
+	if !validUncleanExitPolicy(uncleanExitPolicy) {
+		return Config{}, fmt.Errorf("LMDB_UNCLEAN_EXIT_POLICY must be %q or %q, got %q", uncleanExitPolicyQuarantine, uncleanExitPolicyResume, uncleanExitPolicy)
+	}
+	evidenceDir := strings.TrimSpace(values["LMDB_EVIDENCE_DIR"])
+
 	seedRelays := append([]string(nil), defaultSeedRelays...)
 	if raw := strings.TrimSpace(values["SEED_RELAYS"]); raw != "" {
 		seedRelays, err = parseCSV("SEED_RELAYS", raw)
@@ -277,27 +287,29 @@ func loadConfig(dotEnvPath string, environ []string) (Config, error) {
 	}
 
 	return Config{
-		RelayName:        relayName,
-		RelayPubkey:      relayPubkey,
-		RelayDescription: relayDescription,
-		RelayContact:     withDefault("RELAY_CONTACT", relayPubkey),
-		RelayIcon:        withDefault("RELAY_ICON", "https://pfp.nostr.build/56306a93a88d4c657d8a3dfa57b55a4ed65b709eee927b5dafaab4d5330db21f.png"),
-		DBPath:           dbPath,
-		RelayURL:         relayURL,
-		IndexPath:        indexPath,
-		StaticPath:       staticPath,
-		Port:             port,
-		RefreshInterval:  refreshInterval,
-		MinimumFollowers: minimumFollowers,
-		ArchivalSync:     archivalSync,
-		MaxAgeDays:       maxAgeDays,
-		ArchiveReactions: archiveReactions,
-		IgnoredPubkeys:   ignoredPubkeys,
-		MaxTrustNetwork:  maxTrustNetwork,
-		MaxRelays:        maxRelays,
-		MaxOneHopNetwork: maxOneHopNetwork,
-		SeedRelays:       seedRelays,
-		ArchiveKinds:     archiveKinds,
+		RelayName:             relayName,
+		RelayPubkey:           relayPubkey,
+		RelayDescription:      relayDescription,
+		RelayContact:          withDefault("RELAY_CONTACT", relayPubkey),
+		RelayIcon:             withDefault("RELAY_ICON", "https://pfp.nostr.build/56306a93a88d4c657d8a3dfa57b55a4ed65b709eee927b5dafaab4d5330db21f.png"),
+		DBPath:                dbPath,
+		RelayURL:              relayURL,
+		IndexPath:             indexPath,
+		StaticPath:            staticPath,
+		Port:                  port,
+		RefreshInterval:       refreshInterval,
+		MinimumFollowers:      minimumFollowers,
+		ArchivalSync:          archivalSync,
+		MaxAgeDays:            maxAgeDays,
+		ArchiveReactions:      archiveReactions,
+		IgnoredPubkeys:        ignoredPubkeys,
+		MaxTrustNetwork:       maxTrustNetwork,
+		MaxRelays:             maxRelays,
+		MaxOneHopNetwork:      maxOneHopNetwork,
+		SeedRelays:            seedRelays,
+		ArchiveKinds:          archiveKinds,
+		LMDBUncleanExitPolicy: uncleanExitPolicy,
+		LMDBEvidenceDir:       evidenceDir,
 	}, nil
 }
 
@@ -409,5 +421,7 @@ func restartOnlyConfigChanges(startup, candidate Config) []string {
 	changed("ARCHIVE_REACTIONS", startup.ArchiveReactions != candidate.ArchiveReactions)
 	changed("IGNORE_FOLLOWS_LIST", !slices.Equal(startup.IgnoredPubkeys, candidate.IgnoredPubkeys))
 	changed("ARCHIVE_KINDS", !slices.Equal(startup.ArchiveKinds, candidate.ArchiveKinds))
+	changed("LMDB_UNCLEAN_EXIT_POLICY", startup.LMDBUncleanExitPolicy != candidate.LMDBUncleanExitPolicy)
+	changed("LMDB_EVIDENCE_DIR", startup.LMDBEvidenceDir != candidate.LMDBEvidenceDir)
 	return changes
 }
