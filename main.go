@@ -8,11 +8,13 @@ import (
 	"io"
 	"iter"
 	"log"
+	"math"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"runtime"
+	"slices"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -376,8 +378,91 @@ func refreshProfiles(ctx context.Context, runtime *RuntimeConfig) {
 	log.Printf("👤 profiles refreshed: %d profiles in %v", len(currentTrustNetwork), duration)
 }
 
+// fetchDiscovery visits deduplicated candidate events, but succeeds only when
+// every configured seed explicitly completes its stored-event query. Callers
+// must discard candidate state on any error; pool.FetchMany channel closure
+// alone also represents connection, CLOSED, timeout and stream failures.
+func fetchDiscovery(ctx context.Context, seeds []string, filter nostr.Filter, visit func(nostr.Event)) error {
+	if len(seeds) == 0 {
+		return fmt.Errorf("discovery requires at least one seed relay")
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	seen := make(map[nostr.ID]bool)
+	var firstErr error
+	uniqueSeeds := make(map[string]bool)
+	for _, seed := range seeds {
+		seed = nostr.NormalizeURL(seed)
+		if uniqueSeeds[seed] {
+			continue
+		}
+		uniqueSeeds[seed] = true
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			err := func() error {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				relay, err := pool.EnsureRelay(seed)
+				if err != nil {
+					return err
+				}
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				// The dependency otherwise fabricates EOSE after seven seconds.
+				// Require the actual protocol frame; ctx bounds failure, not success.
+				sub, err := relay.Subscribe(ctx, filter, nostr.SubscriptionOptions{MaxWaitForEOSE: time.Duration(math.MaxInt64)})
+				if err != nil {
+					return err
+				}
+				defer sub.Unsub()
+				for {
+					select {
+					case event, ok := <-sub.Events:
+						if !ok {
+							return fmt.Errorf("discovery stream ended before EOSE")
+						}
+						mu.Lock()
+						if !seen[event.ID] {
+							seen[event.ID] = true
+							visit(event)
+						}
+						mu.Unlock()
+					case eose := <-sub.EndOfStoredEvents:
+						if err := ctx.Err(); err != nil {
+							return err
+						}
+						if slices.Contains(eose.Hint, "more") {
+							return fmt.Errorf("discovery EOSE reports incomplete results")
+						}
+						return nil
+					case reason := <-sub.ClosedReason:
+						return fmt.Errorf("discovery CLOSED before EOSE: %s", reason)
+					case <-sub.Context.Done():
+						return fmt.Errorf("discovery ended before EOSE: %w", context.Cause(sub.Context))
+					}
+				}
+			}()
+			if err != nil {
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				mu.Unlock()
+				cancel()
+			}
+		}()
+	}
+	wg.Wait()
+	return firstErr
+}
+
 func refreshTrustNetwork(ctx context.Context, relay *khatru.Relay, configUpdates <-chan struct{}) {
-	runTrustNetworkRefresh := func(runtime *RuntimeConfig) {
+	runTrustNetworkRefresh := func(runtime *RuntimeConfig) error {
 		atomic.AddUint64(&networkRefreshCount, 1)
 		start := time.Now()
 
@@ -396,8 +481,7 @@ func refreshTrustNetwork(ctx context.Context, relay *khatru.Relay, configUpdates
 
 		ownerPk, err := nostr.PubKeyFromHex(config.RelayPubkey)
 		if err != nil {
-			log.Printf("invalid RELAY_PUBKEY: %v", err)
-			return
+			return fmt.Errorf("invalid RELAY_PUBKEY: %w", err)
 		}
 		filter := nostr.Filter{
 			Authors: []nostr.PubKey{ownerPk},
@@ -406,7 +490,7 @@ func refreshTrustNetwork(ctx context.Context, relay *khatru.Relay, configUpdates
 
 		log.Println("🔍 fetching owner's follows")
 		eventCount := 0
-		for ev := range pool.FetchMany(timeoutCtx, runtime.SeedRelays, filter, nostr.SubscriptionOptions{}) {
+		if err := fetchDiscovery(timeoutCtx, runtime.SeedRelays, filter, func(ev nostr.Event) {
 			eventCount++
 			for contact := range ev.Tags.FindAll("p") {
 				if len(contact) < 2 {
@@ -425,6 +509,8 @@ func refreshTrustNetwork(ctx context.Context, relay *khatru.Relay, configUpdates
 					newOneHopNetworkSet[pubkey] = true
 				}
 			}
+		}); err != nil {
+			return fmt.Errorf("owner follows: %w", err)
 		}
 		log.Printf("🔍 processed %d follow list events", eventCount)
 
@@ -441,6 +527,7 @@ func refreshTrustNetwork(ctx context.Context, relay *khatru.Relay, configUpdates
 		sem := make(chan struct{}, wotConcurrency)
 		var wg sync.WaitGroup
 		var completedBatches int64
+		var discoveryErr error
 		totalBatches := (len(newOneHopNetwork) + wotBatchSize - 1) / wotBatchSize
 
 		for i := 0; i < len(newOneHopNetwork); i += wotBatchSize {
@@ -464,7 +551,7 @@ func refreshTrustNetwork(ctx context.Context, relay *khatru.Relay, configUpdates
 					Kinds:   []nostr.Kind{nostr.KindFollowList, nostr.KindRelayListMetadata, nostr.KindProfileMetadata},
 				}
 
-				for ev := range pool.FetchMany(timeout, runtime.SeedRelays, filter, nostr.SubscriptionOptions{}) {
+				err := fetchDiscovery(timeout, runtime.SeedRelays, filter, func(ev nostr.Event) {
 					atomic.AddInt64(&totalProcessed, 1)
 
 					followerCountMu.Lock()
@@ -483,10 +570,18 @@ func refreshTrustNetwork(ctx context.Context, relay *khatru.Relay, configUpdates
 					followerCountMu.Unlock()
 
 					if ev.Kind == nostr.KindProfileMetadata {
-						if err := db.SaveEvent(ev.Event); err != nil {
+						if err := db.SaveEvent(ev); err != nil {
 							nostr.InfoLogger.Printf("save profile: %v", err)
 						}
 					}
+				})
+				if err != nil {
+					followerCountMu.Lock()
+					if discoveryErr == nil {
+						discoveryErr = err
+					}
+					followerCountMu.Unlock()
+					return
 				}
 
 				done := atomic.AddInt64(&completedBatches, 1)
@@ -497,6 +592,9 @@ func refreshTrustNetwork(ctx context.Context, relay *khatru.Relay, configUpdates
 			}(batch)
 		}
 		wg.Wait()
+		if discoveryErr != nil {
+			return fmt.Errorf("one-hop discovery: %w", discoveryErr)
+		}
 
 		relayMutex.Lock()
 		relays = newRelays
@@ -517,14 +615,24 @@ func refreshTrustNetwork(ctx context.Context, relay *khatru.Relay, configUpdates
 		relayMutex.RLock()
 		log.Println("🔗 relays discovered:", len(relays))
 		relayMutex.RUnlock()
+		return nil
 	}
 
 	// Run initial refresh
 	log.Println("🚀 performing initial trust network build...")
 	initial := runtimeConfig.Load()
-	runTrustNetworkRefresh(initial)
-	updateTrustNetworkFilter(initial)
-	log.Println("✅ trust network initialized, relay is now active")
+	initialErr := runTrustNetworkRefresh(initial)
+	if initialErr != nil {
+		// There is no successful graph to retain at startup. Do not leave the
+		// temporary pre-build admission window open after discovery fails.
+		trustNetworkMutex.Lock()
+		trustNetworkReady = true
+		trustNetworkMutex.Unlock()
+		log.Printf("initial trust network discovery failed; no graph available; rejecting untrusted publications: %v", initialErr)
+	} else {
+		updateTrustNetworkFilter(initial)
+		log.Println("✅ trust network initialized, relay is now active")
+	}
 
 	if err := deleteOldNotes(); err != nil {
 		log.Printf("delete old notes: %v", err)
@@ -543,16 +651,21 @@ func refreshTrustNetwork(ctx context.Context, relay *khatru.Relay, configUpdates
 		}
 	}
 	defer stopArchive()
-	startArchive(initial)
+	if initialErr == nil {
+		startArchive(initial)
+	}
 
 	runRefreshSchedule(ctx, configUpdates, func(reloaded bool, runtime *RuntimeConfig) {
-		stopArchive()
 		if reloaded {
 			log.Println("🔄 runtime configuration changed; refreshing trust network immediately...")
 		} else {
 			log.Println("🔄 refreshing trust network in background...")
 		}
-		runTrustNetworkRefresh(runtime)
+		if err := runTrustNetworkRefresh(runtime); err != nil {
+			log.Printf("trust network discovery failed; keeping last-successful graph: %v", err)
+			return
+		}
+		stopArchive()
 		updateTrustNetworkFilter(runtime)
 		if err := deleteOldNotes(); err != nil {
 			log.Printf("delete old notes: %v", err)

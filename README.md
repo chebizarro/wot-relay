@@ -90,6 +90,13 @@ Follower counts and discovered relays are rebuilt rather than accumulated;
 lowered network/relay limits take effect on that rebuild. The trust limit bounds
 both admission and the profile list, with stable pubkey ordering. An initialized
 empty trust graph rejects untrusted publications instead of allowing everyone.
+Discovery must receive a real, complete EOSE from every configured seed for the
+owner query and every one-hop batch. Connection errors, CLOSED, cancellation,
+timeouts, and explicit incomplete-result hints retain the last successful graph
+and its inventories; they do not count as empty results. An accepted runtime
+snapshot can therefore remain pending graph reconciliation until discovery
+succeeds. On initial discovery failure, no graph is available and publications
+are rejected. Existing archive work is not canceled by a failed rebuild.
 
 `RELAY_PUBKEY` is restart-only because it defines the trust graph. If it
 changes on reload, the relay logs a warning and continues using the startup

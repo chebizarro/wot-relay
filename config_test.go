@@ -528,15 +528,25 @@ func TestRuntimeConfigProcessSIGHUP(t *testing.T) {
 	unsetConfigEnvironment(t)
 	root := testPubkey(1)
 	a, b, c, d := testPubkey(2), testPubkey(3), testPubkey(4), testPubkey(5)
-	seed1 := runtimeSeedFixture(t, []nostr.Event{
+	seed1, stopSeed1 := runtimeSeedFixture(t, []nostr.Event{
 		runtimeFollowEvent(t, 1, nostr.Tags{{"p", a}, {"p", b}}),
 		runtimeFollowEvent(t, 2, nostr.Tags{{"p", c}, {"r", "wss://a.example"}, {"r", "wss://b.example"}}),
 		runtimeFollowEvent(t, 3, nostr.Tags{{"p", d}, {"r", "wss://c.example"}}),
 	})
-	seed2 := runtimeSeedFixture(t, []nostr.Event{
+	seed2, _ := runtimeSeedFixture(t, []nostr.Event{
 		runtimeFollowEvent(t, 1, nostr.Tags{{"p", b}, {"p", a}}),
 		runtimeFollowEvent(t, 3, nostr.Tags{{"p", d}, {"r", "wss://d.example"}, {"r", "wss://e.example"}}),
 	})
+	emptySeed, _ := runtimeSeedFixture(t, nil)
+	partialSeed, _ := runtimeSeedFixture(t, []nostr.Event{
+		runtimeFollowEvent(t, 1, nostr.Tags{{"p", a}}),
+	}, func(relay *khatru.Relay) {
+		relay.OnRequest = func(_ context.Context, filter nostr.Filter) (bool, string) {
+			return len(filter.Authors) == 1 && filter.Authors[0].Hex() == a, "restricted: fixture one-hop discovery unavailable"
+		}
+	})
+	unavailableAtStartup, stopStartupSeed := runtimeSeedFixture(t, nil)
+	stopStartupSeed()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -571,7 +581,7 @@ func TestRuntimeConfigProcessSIGHUP(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	writeCandidate(root, 1, 1, 100, 20, 200, seed1, "")
+	writeCandidate(root, 1, 1, 100, 20, 200, unavailableAtStartup, "")
 	executable, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
@@ -614,7 +624,7 @@ func TestRuntimeConfigProcessSIGHUP(t *testing.T) {
 			}
 		}
 	}
-	waitLog("trust network initialized, relay is now active")
+	waitLog("initial trust network discovery failed; no graph available; rejecting untrusted publications")
 	baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
 	client := &http.Client{Timeout: 2 * time.Second}
 	t.Cleanup(client.CloseIdleConnections)
@@ -696,6 +706,15 @@ func TestRuntimeConfigProcessSIGHUP(t *testing.T) {
 			t.Fatalf("expected WoT rejection for author %d: %v", secret, err)
 		}
 	}
+	// Initial discovery failure must not leave the pre-build admission window
+	// open forever. A subsequent complete rebuild can recover the same process.
+	publish(4, false)
+	writeCandidate(root, 1, 1, 100, 20, 200, seed1, "")
+	if err := cmd.Process.Signal(syscall.SIGHUP); err != nil {
+		t.Fatal(err)
+	}
+	waitLog("trust network refresh completed")
+	checkHealth()
 	publish(4, true)
 
 	// Probe the public health route throughout all live edits, not just at the
@@ -774,7 +793,7 @@ func TestRuntimeConfigProcessSIGHUP(t *testing.T) {
 	signalReload()
 	waitLog("config reload failed; keeping last-valid runtime configuration")
 	checkHealth()
-	if after := string(get("/debug/stats", "")); !strings.Contains(after, "Network Refreshes: 4\n") {
+	if after := string(get("/debug/stats", "")); !strings.Contains(after, "Network Refreshes: 5\n") {
 		t.Fatalf("invalid input triggered refresh:\n%s", after)
 	}
 	keys := []string{a, b, d}
@@ -790,10 +809,49 @@ func TestRuntimeConfigProcessSIGHUP(t *testing.T) {
 	waitLog("trust network refresh completed")
 	checkHealth()
 	publish(4, true)
+	// An unavailable previously used seed must not replace or re-filter the
+	// working graph, even when the accepted candidate raises the threshold.
+	stopSeed1()
+	writeCandidate(root, 2, 99, 1, 1, 1, seed1, "")
+	signalReload()
+	waitLog("trust network discovery failed; keeping last-successful graph")
+	checkHealth()
+	publish(4, true)
+	if after := string(get("/debug/stats", "")); !strings.Contains(after, "Trust Network: 4\n") || !strings.Contains(after, "One Hop Network: 2\n") || !strings.Contains(after, "Relays: 3\n") {
+		t.Fatalf("failed owner discovery replaced working inventories:\n%s", after)
+	}
+
+	// Completing owner discovery is insufficient if any one-hop query fails.
+	writeCandidate(root, 3, 99, 1, 1, 1, partialSeed, "")
+	signalReload()
+	waitLog("trust network discovery failed; keeping last-successful graph: one-hop discovery:")
+	checkHealth()
+	publish(4, true)
+	if after := string(get("/debug/stats", "")); !strings.Contains(after, "Trust Network: 4\n") || !strings.Contains(after, "One Hop Network: 2\n") || !strings.Contains(after, "Relays: 3\n") {
+		t.Fatalf("failed one-hop discovery replaced working inventories:\n%s", after)
+	}
+
+	// A real EOSE with no matching events is a completed empty result, not an
+	// outage. It must replace the old graph and continue to reject everyone.
+	writeCandidate(root, 4, 1, 100, 20, 200, emptySeed, "")
+	signalReload()
+	waitLog("trust network refresh completed")
+	checkHealth()
+	publish(4, false)
+	publish(5, false)
+	if after := string(get("/debug/stats", "")); !strings.Contains(after, "Trust Network: 0\n") || !strings.Contains(after, "One Hop Network: 0\n") || !strings.Contains(after, "Relays: 0\n") {
+		t.Fatalf("completed empty discovery did not replace graph:\n%s", after)
+	}
+	// The empty result is not sticky: a subsequent complete graph recovers.
+	writeCandidate(root, 1, 1, 100, 20, 200, seed2, "")
+	signalReload()
+	waitLog("trust network refresh completed")
+	checkHealth()
+	publish(5, true)
 	if probes.Load() == 0 {
 		t.Fatal("no concurrent public health probes completed")
 	}
-	t.Logf("local production-entrypoint acceptance: PID=%d unchanged; persistent websocket; valid threshold/seed/limit changes; invalid candidate retained live state; health probes=%d; LMDB/root/listener unchanged", pid, probes.Load())
+	t.Logf("local production-entrypoint acceptance: PID=%d unchanged; persistent websocket; valid threshold/seed/limit changes; invalid candidate retained live state; health probes=%d; LMDB/root/listener unchanged; initial discovery failure rejects; unavailable seed and failed one-hop retain graph; completed empty EOSE denies all; subsequent recovery", pid, probes.Load())
 }
 
 func runtimeFollowEvent(t *testing.T, secret byte, tags nostr.Tags) nostr.Event {
@@ -807,7 +865,7 @@ func runtimeFollowEvent(t *testing.T, secret byte, tags nostr.Tags) nostr.Event 
 	return event
 }
 
-func runtimeSeedFixture(t *testing.T, events []nostr.Event) string {
+func runtimeSeedFixture(t *testing.T, events []nostr.Event, hooks ...func(*khatru.Relay)) (string, func()) {
 	t.Helper()
 	relay := khatru.NewRelay()
 	relay.QueryStored = func(ctx context.Context, filter nostr.Filter) iter.Seq[nostr.Event] {
@@ -819,9 +877,37 @@ func runtimeSeedFixture(t *testing.T, events []nostr.Event) string {
 			}
 		}
 	}
-	server := httptest.NewServer(relay)
-	t.Cleanup(server.Close)
-	return "ws" + strings.TrimPrefix(server.URL, "http")
+	for _, hook := range hooks {
+		hook(relay)
+	}
+	// httptest.Server.Close does not close hijacked websocket connections.
+	// Track the underlying connections so an outage closes both the listener
+	// and existing seed sessions, deterministically and without sleeping.
+	var mu sync.Mutex
+	connections := make(map[net.Conn]bool)
+	server := httptest.NewUnstartedServer(relay)
+	server.Config.ConnState = func(conn net.Conn, state http.ConnState) {
+		mu.Lock()
+		defer mu.Unlock()
+		if state == http.StateNew {
+			connections[conn] = true
+		}
+		if state == http.StateClosed {
+			delete(connections, conn)
+		}
+	}
+	server.Start()
+	stop := func() {
+		server.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		for conn := range connections {
+			_ = conn.Close()
+			delete(connections, conn)
+		}
+	}
+	t.Cleanup(stop)
+	return "ws" + strings.TrimPrefix(server.URL, "http"), stop
 }
 
 type runtimeProcessLogs struct {
@@ -851,4 +937,72 @@ func (l *runtimeProcessLogs) String() string {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.buffer.String()
+}
+
+func TestFetchDiscoveryRequiresCompleteEOSE(t *testing.T) {
+	oldPool := pool
+	ctx, cancel := context.WithCancel(context.Background())
+	pool = nostr.NewPool()
+	pool.Context = ctx
+	t.Cleanup(func() { cancel(); pool.Close("discovery test finished"); pool = oldPool })
+	empty, _ := runtimeSeedFixture(t, nil)
+	unavailable, stop := runtimeSeedFixture(t, nil)
+	stop()
+	closed, _ := runtimeSeedFixture(t, nil, func(relay *khatru.Relay) {
+		relay.OnRequest = func(context.Context, nostr.Filter) (bool, string) { return true, "restricted: fixture" }
+	})
+	for _, tc := range []struct {
+		name      string
+		seeds     []string
+		wantError bool
+	}{
+		{"complete empty", []string{empty}, false},
+		{"unavailable", []string{unavailable}, true},
+		{"complete empty plus unavailable", []string{empty, unavailable}, true},
+		{"CLOSED", []string{closed}, true},
+		{"no seeds", nil, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			visited := false
+			err := fetchDiscovery(queryCtx, tc.seeds, nostr.Filter{Kinds: []nostr.Kind{nostr.KindFollowList}}, func(nostr.Event) { visited = true })
+			if (err != nil) != tc.wantError {
+				t.Fatalf("discovery error=%v wantError=%v", err, tc.wantError)
+			}
+			if visited {
+				t.Fatal("empty fixture delivered an event")
+			}
+		})
+	}
+
+	t.Run("canceled before EOSE", func(t *testing.T) {
+		requested := make(chan struct{}, 1)
+		incomplete, _ := runtimeSeedFixture(t, nil, func(relay *khatru.Relay) {
+			relay.OnRequest = func(context.Context, nostr.Filter) (bool, string) { requested <- struct{}{}; return false, "" }
+			relay.QueryStored = func(ctx context.Context, _ nostr.Filter) iter.Seq[nostr.Event] {
+				return func(func(nostr.Event) bool) { <-ctx.Done() }
+			}
+		})
+		queryCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		result := make(chan error, 1)
+		go func() {
+			result <- fetchDiscovery(queryCtx, []string{incomplete}, nostr.Filter{Kinds: []nostr.Kind{nostr.KindFollowList}}, func(nostr.Event) {})
+		}()
+		select {
+		case <-requested:
+		case <-time.After(5 * time.Second):
+			t.Fatal("query did not start")
+		}
+		cancel() // explicit application cancellation, never timeout-as-success
+		select {
+		case err := <-result:
+			if err == nil {
+				t.Fatal("canceled discovery reported complete")
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("canceled discovery did not finish")
+		}
+	})
 }
