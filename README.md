@@ -78,7 +78,18 @@ docker kill --signal=HUP wot-relay
 `MAX_ONE_HOP_NETWORK`, `MAX_RELAYS`, and `SEED_RELAYS` reload without a
 restart. A successful reload atomically publishes the complete live snapshot,
 resets the refresh ticker, and immediately refreshes the trust graph. Invalid
-candidates are rejected and the last-valid snapshot remains active.
+candidates are rejected and the last-valid snapshot remains active. Write a
+complete candidate file before signalling (for example, atomically rename a
+replacement `.env`). The interval must be 1–2562047 hours so it fits Go's timer
+range.
+
+Each refresh uses one captured runtime snapshot throughout graph discovery,
+filter construction, and archive/profile setup. Updates received during a
+refresh are coalesced into a subsequent refresh using the latest valid snapshot.
+Follower counts and discovered relays are rebuilt rather than accumulated;
+lowered network/relay limits take effect on that rebuild. The trust limit bounds
+both admission and the profile list, with stable pubkey ordering. An initialized
+empty trust graph rejects untrusted publications instead of allowing everyone.
 
 `RELAY_PUBKEY` is restart-only because it defines the trust graph. If it
 changes on reload, the relay logs a warning and continues using the startup

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net/url"
 	"os"
 	"slices"
@@ -206,6 +207,9 @@ func loadConfig(dotEnvPath string, environ []string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	if int64(refreshInterval) > math.MaxInt64/int64(time.Hour) {
+		return Config{}, fmt.Errorf("REFRESH_INTERVAL_HOURS exceeds maximum supported interval")
+	}
 	minimumFollowers, err := parseInt("MINIMUM_FOLLOWERS", 1, 0)
 	if err != nil {
 		return Config{}, err
@@ -356,7 +360,10 @@ func handleConfigReloads(
 		select {
 		case <-ctx.Done():
 			return
-		case <-signals:
+		case _, ok := <-signals:
+			if !ok {
+				return
+			}
 			logger.Println("SIGHUP received; reloading runtime configuration")
 			if err := reloadRuntimeConfig(load, startup, store, updates, logger); err != nil {
 				logger.Printf("config reload failed; keeping last-valid runtime configuration: %v", err)

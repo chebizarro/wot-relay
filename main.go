@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -33,7 +34,6 @@ var (
 var pool *nostr.Pool
 var db *lmdb.LMDBBackend
 var relays []string
-var relaySet = make(map[string]bool) // O(1) lookup
 var config Config
 var runtimeConfig runtimeConfigStore
 var trustNetwork []string
@@ -41,6 +41,7 @@ var trustNetworkSet = make(map[string]bool) // O(1) lookup
 var oneHopNetwork []string
 var oneHopNetworkSet = make(map[string]bool) // O(1) lookup
 var trustNetworkMap map[string]bool
+var trustNetworkReady bool // guarded by trustNetworkMutex, including an intentionally empty graph
 var pubkeyFollowerCount = make(map[string]int)
 var trustedNotes uint64
 var untrustedNotes uint64
@@ -177,34 +178,7 @@ func main() {
 	relay.OnEvent = policies.SeqEvent(
 		policies.RejectEventsWithBase64Media,
 		policies.EventIPRateLimiter(5, time.Minute*1, 30),
-		func(ctx context.Context, event nostr.Event) (bool, string) {
-			atomic.AddUint64(&totalEvents, 1)
-
-			pkHex := event.PubKey.Hex()
-			trustNetworkMutex.RLock()
-			trusted := trustNetworkMap[pkHex]
-			hasNetwork := len(trustNetworkMap) > 0
-			trustNetworkMutex.RUnlock()
-
-			// While the trust network is still being built for the first time (no
-			// list yet), accept everything. On subsequent rebuilds the old map
-			// remains active via atomic swap, so we never reject against an empty
-			// list.
-			if !hasNetwork {
-				return false, ""
-			}
-
-			if !trusted {
-				atomic.AddUint64(&rejectedEvents, 1)
-				return true, "not in web of trust"
-			}
-			if event.Kind == nostr.KindEncryptedDirectMessage {
-				atomic.AddUint64(&rejectedEvents, 1)
-				return true, "only gift wrapped DMs are allowed"
-			}
-
-			return false, ""
-		},
+		rejectUntrustedEvent,
 	)
 
 	relay.OnRequest = policies.SeqRequest(
@@ -266,8 +240,30 @@ func main() {
 	}
 }
 
-func updateTrustNetworkFilter() {
-	runtime := runtimeConfig.Load()
+func rejectUntrustedEvent(ctx context.Context, event nostr.Event) (bool, string) {
+	atomic.AddUint64(&totalEvents, 1)
+	trustNetworkMutex.RLock()
+	trusted := trustNetworkMap[event.PubKey.Hex()]
+	ready := trustNetworkReady
+	trustNetworkMutex.RUnlock()
+
+	// Preserve startup admission until the first build, but never treat an
+	// intentionally empty rebuilt graph as permission to accept everyone.
+	if !ready {
+		return false, ""
+	}
+	if !trusted {
+		atomic.AddUint64(&rejectedEvents, 1)
+		return true, "not in web of trust"
+	}
+	if event.Kind == nostr.KindEncryptedDirectMessage {
+		atomic.AddUint64(&rejectedEvents, 1)
+		return true, "only gift wrapped DMs are allowed"
+	}
+	return false, ""
+}
+
+func updateTrustNetworkFilter(runtime *RuntimeConfig) {
 	// Build new trust network in temporary variables
 	newTrustNetworkMap := make(map[string]bool)
 	var newTrustNetwork []string
@@ -276,13 +272,17 @@ func updateTrustNetworkFilter() {
 	log.Println("🌐 building new trust network map")
 
 	followerMutex.RLock()
-	for pubkey, count := range pubkeyFollowerCount {
-		if count >= runtime.MinimumFollowers {
+	// Stable ordering keeps bounded membership deterministic across rebuilds.
+	keys := make([]string, 0, len(pubkeyFollowerCount))
+	for pubkey := range pubkeyFollowerCount {
+		keys = append(keys, pubkey)
+	}
+	sort.Strings(keys)
+	for _, pubkey := range keys {
+		if pubkeyFollowerCount[pubkey] >= runtime.MinimumFollowers && len(pubkey) == 64 && len(newTrustNetwork) < runtime.MaxTrustNetwork {
 			newTrustNetworkMap[pubkey] = true
-			if !newTrustNetworkSet[pubkey] && len(pubkey) == 64 && len(newTrustNetwork) < runtime.MaxTrustNetwork {
-				newTrustNetwork = append(newTrustNetwork, pubkey)
-				newTrustNetworkSet[pubkey] = true
-			}
+			newTrustNetwork = append(newTrustNetwork, pubkey)
+			newTrustNetworkSet[pubkey] = true
 		}
 	}
 	followerMutex.RUnlock()
@@ -290,6 +290,7 @@ func updateTrustNetworkFilter() {
 	// Now atomically replace the active trust network
 	trustNetworkMutex.Lock()
 	trustNetworkMap = newTrustNetworkMap
+	trustNetworkReady = true
 	trustNetwork = newTrustNetwork
 	trustNetworkSet = newTrustNetworkSet
 	trustNetworkMutex.Unlock()
@@ -298,7 +299,7 @@ func updateTrustNetworkFilter() {
 
 	// Cleanup follower count map periodically to prevent unbounded growth
 	followerMutex.Lock()
-	if len(pubkeyFollowerCount) > runtime.MaxOneHopNetwork*2 {
+	if len(pubkeyFollowerCount) > runtime.MaxOneHopNetwork && len(pubkeyFollowerCount)-runtime.MaxOneHopNetwork > runtime.MaxOneHopNetwork {
 		log.Println("🧹 cleaning follower count map")
 		newFollowerCount := make(map[string]int)
 		for pubkey, count := range pubkeyFollowerCount {
@@ -323,8 +324,7 @@ func hexToPubKeys(hexes []string) []nostr.PubKey {
 	return out
 }
 
-func refreshProfiles(ctx context.Context) {
-	runtime := runtimeConfig.Load()
+func refreshProfiles(ctx context.Context, runtime *RuntimeConfig) {
 	atomic.AddUint64(&profileRefreshCount, 1)
 	start := time.Now()
 
@@ -377,8 +377,7 @@ func refreshProfiles(ctx context.Context) {
 }
 
 func refreshTrustNetwork(ctx context.Context, relay *khatru.Relay, configUpdates <-chan struct{}) {
-	runTrustNetworkRefresh := func() {
-		runtime := runtimeConfig.Load()
+	runTrustNetworkRefresh := func(runtime *RuntimeConfig) {
 		atomic.AddUint64(&networkRefreshCount, 1)
 		start := time.Now()
 
@@ -387,12 +386,10 @@ func refreshTrustNetwork(ctx context.Context, relay *khatru.Relay, configUpdates
 		newOneHopNetworkSet := make(map[string]bool)
 		newPubkeyFollowerCount := make(map[string]int)
 
-		// Copy existing follower counts to preserve data
-		followerMutex.RLock()
-		for k, v := range pubkeyFollowerCount {
-			newPubkeyFollowerCount[k] = v
-		}
-		followerMutex.RUnlock()
+		// Rebuild counts and relay discovery rather than accumulating the same
+		// follows on every reload. Reduced limits must shrink the live inventory.
+		var newRelays []string
+		newRelaySet := make(map[string]bool)
 
 		timeoutCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 		defer cancel()
@@ -470,22 +467,20 @@ func refreshTrustNetwork(ctx context.Context, relay *khatru.Relay, configUpdates
 				for ev := range pool.FetchMany(timeout, runtime.SeedRelays, filter, nostr.SubscriptionOptions{}) {
 					atomic.AddInt64(&totalProcessed, 1)
 
-					hasP := false
 					followerCountMu.Lock()
 					for contact := range ev.Tags.FindAll("p") {
 						if len(contact) > 1 {
 							newPubkeyFollowerCount[contact[1]]++
-							hasP = true
 						}
 					}
-					followerCountMu.Unlock()
-					_ = hasP
-
 					for relayTag := range ev.Tags.FindAll("r") {
-						if len(relayTag) > 1 {
-							appendRelay(relayTag[1])
+						if len(relayTag) > 1 && !newRelaySet[relayTag[1]] && len(newRelays) < runtime.MaxRelays {
+							newRelays = append(newRelays, relayTag[1])
+							newRelaySet[relayTag[1]] = true
 						}
 					}
+
+					followerCountMu.Unlock()
 
 					if ev.Kind == nostr.KindProfileMetadata {
 						if err := db.SaveEvent(ev.Event); err != nil {
@@ -502,6 +497,10 @@ func refreshTrustNetwork(ctx context.Context, relay *khatru.Relay, configUpdates
 			}(batch)
 		}
 		wg.Wait()
+
+		relayMutex.Lock()
+		relays = newRelays
+		relayMutex.Unlock()
 
 		// Now atomically replace the active data structures
 		oneHopMutex.Lock()
@@ -522,8 +521,9 @@ func refreshTrustNetwork(ctx context.Context, relay *khatru.Relay, configUpdates
 
 	// Run initial refresh
 	log.Println("🚀 performing initial trust network build...")
-	runTrustNetworkRefresh()
-	updateTrustNetworkFilter()
+	initial := runtimeConfig.Load()
+	runTrustNetworkRefresh(initial)
+	updateTrustNetworkFilter(initial)
 	log.Println("✅ trust network initialized, relay is now active")
 
 	if err := deleteOldNotes(); err != nil {
@@ -531,10 +531,10 @@ func refreshTrustNetwork(ctx context.Context, relay *khatru.Relay, configUpdates
 	}
 
 	var cancelArchive context.CancelFunc
-	startArchive := func() {
+	startArchive := func(runtime *RuntimeConfig) {
 		archiveCtx, cancel := context.WithCancel(ctx)
 		cancelArchive = cancel
-		go archiveTrustedNotes(archiveCtx, relay)
+		go archiveTrustedNotes(archiveCtx, relay, runtime)
 	}
 	stopArchive := func() {
 		if cancelArchive != nil {
@@ -543,21 +543,21 @@ func refreshTrustNetwork(ctx context.Context, relay *khatru.Relay, configUpdates
 		}
 	}
 	defer stopArchive()
-	startArchive()
+	startArchive(initial)
 
-	runRefreshSchedule(ctx, configUpdates, func(reloaded bool) {
+	runRefreshSchedule(ctx, configUpdates, func(reloaded bool, runtime *RuntimeConfig) {
 		stopArchive()
 		if reloaded {
 			log.Println("🔄 runtime configuration changed; refreshing trust network immediately...")
 		} else {
 			log.Println("🔄 refreshing trust network in background...")
 		}
-		runTrustNetworkRefresh()
-		updateTrustNetworkFilter()
+		runTrustNetworkRefresh(runtime)
+		updateTrustNetworkFilter(runtime)
 		if err := deleteOldNotes(); err != nil {
 			log.Printf("delete old notes: %v", err)
 		}
-		startArchive()
+		startArchive(runtime)
 		log.Println("✅ trust network refresh completed")
 	}, newRefreshTicker)
 }
@@ -583,7 +583,7 @@ func newRefreshTicker(interval time.Duration) refreshTicker {
 func runRefreshSchedule(
 	ctx context.Context,
 	configUpdates <-chan struct{},
-	refresh func(reloaded bool),
+	refresh func(reloaded bool, runtime *RuntimeConfig),
 	newTicker func(time.Duration) refreshTicker,
 ) {
 	ticker := newTicker(runtimeConfig.Load().RefreshInterval)
@@ -594,29 +594,16 @@ func runRefreshSchedule(
 		case <-ctx.Done():
 			return
 		case <-ticker.Chan():
-			refresh(false)
-		case <-configUpdates:
-			ticker.Reset(runtimeConfig.Load().RefreshInterval)
-			refresh(true)
+			refresh(false, runtimeConfig.Load())
+		case _, ok := <-configUpdates:
+			if !ok {
+				return
+			}
+			runtime := runtimeConfig.Load()
+			ticker.Reset(runtime.RefreshInterval)
+			refresh(true, runtime)
 		}
 	}
-}
-
-func appendRelay(relay string) {
-	runtime := runtimeConfig.Load()
-	relayMutex.Lock()
-	defer relayMutex.Unlock()
-
-	if len(relays) >= runtime.MaxRelays {
-		return // Prevent unbounded growth
-	}
-
-	if relaySet[relay] {
-		return // Already exists
-	}
-
-	relays = append(relays, relay)
-	relaySet[relay] = true
 }
 
 func appendPubkey(pubkey string) {
@@ -640,8 +627,7 @@ func appendPubkey(pubkey string) {
 	trustNetworkSet[pubkey] = true
 }
 
-func archiveTrustedNotes(ctx context.Context, relay *khatru.Relay) {
-	runtimeCfg := runtimeConfig.Load()
+func archiveTrustedNotes(ctx context.Context, relay *khatru.Relay, runtimeCfg *RuntimeConfig) {
 	timeout, cancel := context.WithTimeout(ctx, runtimeCfg.RefreshInterval)
 	defer cancel()
 
@@ -651,7 +637,7 @@ func archiveTrustedNotes(ctx context.Context, relay *khatru.Relay) {
 		return
 	}
 
-	go refreshProfiles(timeout)
+	go refreshProfiles(timeout, runtimeCfg)
 
 	filter := nostr.Filter{
 		Kinds: config.ArchiveKinds,
@@ -836,6 +822,19 @@ func debugStatsHandler(w http.ResponseWriter, r *http.Request) {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
 
+	relayMutex.RLock()
+	relayCount := len(relays)
+	relayMutex.RUnlock()
+	trustNetworkMutex.RLock()
+	trustCount := len(trustNetwork)
+	trustNetworkMutex.RUnlock()
+	oneHopMutex.RLock()
+	oneHopCount := len(oneHopNetwork)
+	oneHopMutex.RUnlock()
+	followerMutex.RLock()
+	followerCount := len(pubkeyFollowerCount)
+	followerMutex.RUnlock()
+
 	stats := fmt.Sprintf(`Debug Statistics:
 
 Memory:
@@ -874,10 +873,10 @@ Data Structures:
 		atomic.LoadUint64(&untrustedNotes),
 		atomic.LoadUint64(&profileRefreshCount),
 		atomic.LoadUint64(&networkRefreshCount),
-		len(relays),
-		len(trustNetwork),
-		len(oneHopNetwork),
-		len(pubkeyFollowerCount),
+		relayCount,
+		trustCount,
+		oneHopCount,
+		followerCount,
 	)
 
 	w.Header().Set("Content-Type", "text/plain")
